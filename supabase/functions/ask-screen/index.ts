@@ -21,7 +21,13 @@ Deno.serve(async (request) => {
   // Reserve immediately before the paid provider call. A failed provider call is
   // refunded below, while concurrent requests cannot bypass a monthly limit.
   const { data: allowed, error: quotaError } = await supabase.rpc("consume_screen_request");
-  if (quotaError || !allowed) return json({ error: "Your plan is inactive or its monthly allowance is used." }, 403);
+  if (quotaError || !allowed) {
+    const { data: profile } = await supabase.from("profiles").select("plan_status").single();
+    const message = profile?.plan_status === "active"
+      ? "Your monthly request allowance is used."
+      : "Your 10 free requests are used. Choose a plan to continue.";
+    return json({ error: message }, 403);
+  }
   let refundable = true;
   const refund = async () => {
     if (!refundable) return;

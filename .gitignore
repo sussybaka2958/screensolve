@@ -1,3 +1,5 @@
 __pycache__/ 
 *.pyc
 .env
+supabase_config.json
+.venv-macos/

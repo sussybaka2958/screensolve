@@ -26,6 +26,22 @@ ScreenSolve has a real email/password flow. The customer app never contains the 
 
 The Edge Function reads the Gemini key from Supabase Secrets, and authenticated users call it with their own session JWT. Supabase documents this server-side secret pattern in its [Edge Function secrets guide](https://supabase.com/docs/guides/functions/secrets) and recommends authenticated function calls for signed-in users in its [function security guide](https://supabase.com/docs/guides/functions/auth).
 
+## Google sign-in setup
+
+The desktop apps include a **Continue with Google** button. It uses a browser,
+Supabase Auth, PKCE, and a short-lived callback on the same computer. Neither
+desktop app stores a Google client secret or a Gemini key.
+
+1. In Google Cloud's **Google Auth Platform**, configure Branding, Audience, and only the `openid`, email, and profile scopes.
+2. Create an OAuth client of type **Web application**. In its authorized redirect URIs, add the exact callback displayed at **Supabase Dashboard → Authentication → Providers → Google**: `https://YOUR_PROJECT_REF.supabase.co/auth/v1/callback`.
+3. In **Supabase Dashboard → Authentication → Providers → Google**, enable Google and add that Google client ID and client secret. They remain in Supabase.
+4. In **Authentication → URL Configuration → Redirect URLs**, add `http://127.0.0.1:51824/auth/callback`. Keep the Site URL set to your real public site.
+5. Build or run the app, choose **Continue with Google**, finish consent in the browser, and return to the confirmation tab. ScreenSolve will save the resulting Supabase session in Keychain/Credential Manager.
+
+The 10-free-solve profile is created by the existing `auth.users` trigger for
+Google accounts too. Supabase will link a Google identity to an existing account
+with the same verified email, so that account keeps its original quota.
+
 ## Gemini API key setup (owner only)
 
 You need one Gemini API key for the whole product. Customers do not see, paste, or possess it.
@@ -35,11 +51,11 @@ You need one Gemini API key for the whole product. Customers do not see, paste, 
 3. Add it as the `GEMINI_API_KEY` Edge Function secret in Supabase, as described above.
 4. Do not put it in `ScreenSolve.pyw`, `supabase_config.json`, GitHub Actions secrets that are printed in logs, or customer devices.
 
-Never paste an API key into source code, GitHub, Discord, or a public issue. If it is exposed, revoke it immediately and create another. The developer password supplied in chat should also be changed before you use it anywhere, because it is no longer private.
+Never paste an API key into source code, GitHub, Discord, or a public issue. If it is exposed, revoke it immediately and create another.
 
 ## Charging customers
 
-New accounts are inactive, so they cannot use paid Gemini requests. The included Stripe functions automate activation, plan changes, failed payments, and cancellation. The Gemini API key remains only in a Supabase Edge Function secret.
+Every new, confirmed account receives 10 free screen requests. The allowance is stored in the authenticated user's Supabase profile and consumed atomically by `ask-screen`; the desktop client cannot reset it. After request 10, ScreenSolve directs the customer to choose a paid plan. The included Stripe functions automate activation, plan changes, failed payments, and cancellation. The Gemini API key remains only in a Supabase Edge Function secret.
 
 ### One-time owner setup
 
@@ -88,6 +104,28 @@ Copy-Item supabase_config.example.json supabase_config.json
 notepad supabase_config.json
 pyw ScreenSolve.pyw
 ```
+
+## macOS development run
+
+The macOS client uses the same Supabase account, 10-free-request allowance,
+and protected `ask-screen` function as the Windows client. It does not use or
+store a Gemini API key.
+
+```sh
+brew install python@3.13 python-tk@3.13
+python3.13 -m venv .venv-macos
+.venv-macos/bin/python -m pip install -r requirements-macos.txt
+cp supabase_config.example.json supabase_config.json
+# Add the Supabase project's URL and publishable/anon key to that file.
+./run_macos.sh
+```
+
+Grant the Terminal app Accessibility permission for the global hotkey and
+Screen Recording permission before capturing a screen.
+
+After signing in, ScreenSolve stays available from its macOS app menu. Choose
+**Open ScreenSolve** to return to account settings, usage, permissions, plans,
+or sign out. The answer window has Copy, Capture again, and Settings actions.
 
 ## Privacy
 

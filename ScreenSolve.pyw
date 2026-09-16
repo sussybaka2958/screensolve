@@ -15,6 +15,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 
+from desktop_oauth import google_sign_in
+
 import keyboard
 from PIL import Image, ImageDraw, ImageGrab
 try:
@@ -28,7 +30,7 @@ except ImportError:
 
 APP_NAME = "ScreenSolve"
 HOTKEY = "ctrl+shift+space"
-ACCENT, BG, PANEL, TEXT, MUTED = "#A78BFA", "#080B14", "#141A2D", "#F7F7FB", "#A8B0C7"
+ACCENT, BG, PANEL, TEXT, MUTED = "#7C3AED", "#080B14", "#141A2D", "#F7F7FB", "#A8B0C7"
 SURFACE, HEADER, SUCCESS = "#101624", "#0C1120", "#8B5CF6"
 HEADER_HEIGHT = 58
 WM_NCHITTEST, HTTRANSPARENT = 0x0084, -1
@@ -49,6 +51,7 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 CONFIG_FILE = (Path(sys.executable).with_name("supabase_config.json")
                if getattr(sys, "frozen", False) else Path(__file__).with_name("supabase_config.json"))
 events = queue.Queue()
+_memory_secrets = {}
 
 
 def load_json(path, default):
@@ -64,25 +67,41 @@ def settings():
 
 def save_settings(values):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    values.pop("session", None)
     SETTINGS_FILE.write_text(json.dumps(values, indent=2), encoding="utf-8")
 
 
 def secret(name, value=None):
-    """Use Windows Credential Manager when keyring is installed."""
+    """Use Windows Credential Manager; never persist a session in plaintext."""
+    data = settings()
+    legacy = data.pop(name, None)
+    if legacy is not None:
+        save_settings(data)
     if keyring:
         try:
             if value is not None:
                 keyring.set_password(APP_NAME, name, value)
-            return keyring.get_password(APP_NAME, name)
+                return value
+            stored = keyring.get_password(APP_NAME, name)
+            if stored:
+                return stored
+            if legacy:
+                keyring.set_password(APP_NAME, name, legacy)
+                return legacy
         except Exception:
-            # Some stripped-down Windows installs have no credential backend.
-            # Fall back to local settings rather than making the app unusable.
             pass
-    data = settings()
     if value is not None:
-        data[name] = value
-        save_settings(data)
-    return data.get(name)
+        _memory_secrets[name] = value
+    return _memory_secrets.get(name)
+
+
+def delete_secret(name):
+    _memory_secrets.pop(name, None)
+    if keyring:
+        try:
+            keyring.delete_password(APP_NAME, name)
+        except Exception:
+            pass
 
 
 def supabase_config():
@@ -105,24 +124,39 @@ def api_request(path, payload):
     except urllib.error.HTTPError as error:
         detail = error.read().decode(errors="replace")
         try:
-            detail = json.loads(detail).get("msg") or json.loads(detail).get("message") or detail
+            parsed = json.loads(detail)
+            detail = parsed.get("msg") or parsed.get("message") or parsed.get("error") or detail
         except json.JSONDecodeError:
             pass
         raise RuntimeError(detail) from error
 
 
-def sign_in(email, password):
-    response = api_request("/auth/v1/token?grant_type=password", {"email": email, "password": password})
+def save_session(response, email=""):
+    if not response.get("access_token"):
+        raise RuntimeError("The sign-in service did not return a session. Please try again.")
     secret("session", json.dumps({"access_token": response["access_token"], "refresh_token": response.get("refresh_token")}))
-    data = settings(); data["email"] = email; save_settings(data)
+    data = settings()
+    data["email"] = email or response.get("user", {}).get("email", data.get("email", ""))
+    save_settings(data)
+
+
+def sign_in(email, password):
+    save_session(api_request("/auth/v1/token?grant_type=password", {"email": email, "password": password}), email)
 
 
 def sign_up(email, password):
     response = api_request("/auth/v1/signup", {"email": email, "password": password})
     if response.get("access_token"):
-        secret("session", json.dumps({"access_token": response["access_token"], "refresh_token": response.get("refresh_token")}))
-    data = settings(); data["email"] = email; save_settings(data)
+        save_session(response, email)
     return bool(response.get("access_token"))
+
+
+def sign_in_with_google():
+    cfg = supabase_config()
+    url, key = cfg.get("url"), cfg.get("publishable_key") or cfg.get("anon_key")
+    if not url or not key or "YOUR_" in key:
+        raise RuntimeError("Accounts are not configured yet. Follow the README Supabase setup.")
+    save_session(google_sign_in(url, key))
 
 
 def session_data():
@@ -137,7 +171,7 @@ def refresh_session():
     if not refresh_token:
         raise RuntimeError("Your session has expired. Please sign in again.")
     response = api_request("/auth/v1/token?grant_type=refresh_token", {"refresh_token": refresh_token})
-    secret("session", json.dumps({"access_token": response["access_token"], "refresh_token": response.get("refresh_token")}))
+    save_session(response)
     return response["access_token"]
 
 
@@ -145,7 +179,7 @@ def current_profile():
     cfg = supabase_config(); public_key = cfg.get("publishable_key") or cfg.get("anon_key")
     token = session_data().get("access_token")
     if not token: return {}
-    req = urllib.request.Request(cfg["url"].rstrip("/") + "/rest/v1/profiles?select=role,plan_status,plan_id,monthly_requests,requests_used", headers={"apikey": public_key, "Authorization": f"Bearer {token}"})
+    req = urllib.request.Request(cfg["url"].rstrip("/") + "/rest/v1/profiles?select=role,plan_status,plan_id,monthly_requests,requests_used,free_requests_limit,free_requests_used", headers={"apikey": public_key, "Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             rows = json.loads(response.read().decode())
@@ -203,7 +237,8 @@ def ask_service(image_bytes):
             except (json.JSONDecodeError, UnicodeDecodeError):
                 server_error = ""
             allowed_messages = {
-                "Your plan is inactive or its monthly allowance is used.",
+                "Your 10 free requests are used. Choose a plan to continue.",
+                "Your monthly request allowance is used.",
                 "Screenshot is missing or too large.",
                 "Sign in required",
                 "Invalid session",
@@ -216,7 +251,8 @@ def ask_service(image_bytes):
         # The server's friendly, allow-listed errors may be shown. Do not relay
         # unexpected strings: they can contain provider configuration details.
         server_error = result.get("error", "")
-        if server_error in {"Your plan is inactive or its monthly allowance is used.",
+        if server_error in {"Your 10 free requests are used. Choose a plan to continue.",
+                            "Your monthly request allowance is used.",
                             "Screenshot is missing or too large.", "Sign in required", "Invalid session"}:
             raise RuntimeError(server_error)
         raise RuntimeError("The answer service returned no usable answer. Please try again shortly.")
@@ -331,34 +367,65 @@ class SetupWindow:
         return tk.Label(parent, text=text, fg=color, bg=parent.cget("bg"), font=("Segoe UI", size, "bold" if bold else "normal"), justify="left", anchor="w")
     def button(self, parent, text, command, outline=False):
         return tk.Button(parent, text=text, command=command, font=("Segoe UI", 10, "bold"), fg=TEXT, bg=BG if outline else ACCENT, activebackground="#6D45CF", activeforeground=TEXT, relief="flat", bd=0, pady=12, cursor="hand2")
+    def _auth_task(self, buttons, status, action, success):
+        """Keep the desktop UI responsive while auth opens a browser or waits on the network."""
+        original = [(button, button.cget("text")) for button in buttons]
+        for button, _text in original:
+            button.config(state="disabled")
+        status.config(text="Working…", fg="#C4B5FD")
+        def complete(error=None, result=None):
+            for button, text in original:
+                if button.winfo_exists():
+                    button.config(state="normal", text=text)
+            if error:
+                status.config(text=str(error), fg="#FCA5A5")
+            else:
+                success(result)
+        def worker():
+            try:
+                result = action()
+            except Exception as exc:
+                self.win.after(0, lambda: complete(exc))
+            else:
+                self.win.after(0, lambda: complete(result=result))
+        threading.Thread(target=worker, daemon=True).start()
     def _landing(self):
         self.clear(); frame = tk.Frame(self.win, bg=BG); frame.pack(fill="both", expand=True, padx=64, pady=56)
         self.label(frame, "✦  ScreenSolve", 16, "#C4B5FD", True).pack(anchor="w", pady=(0, 48))
         self.label(frame, "Understand anything\non your screen.", 28, TEXT, True).pack(anchor="w")
         self.label(frame, "Your private, on-demand AI screen companion.", 12, MUTED).pack(anchor="w", pady=(12, 38))
+        status = self.label(frame, "", 9, "#FCA5A5")
+        status.pack(side="bottom", anchor="w")
+        google = self.button(frame, "Continue with Google", lambda: self._auth_task([google], status, sign_in_with_google, lambda _result: self._settings()), True)
+        google.pack(fill="x", pady=(0, 8))
         self.button(frame, "Create your account", lambda: self._auth(False)).pack(fill="x", pady=6)
         self.button(frame, "Sign in", lambda: self._auth(True), True).pack(fill="x", pady=6)
-        self.label(frame, "Already configured this device? Open Settings after signing in.", 9, MUTED).pack(anchor="w", pady=(22, 0))
+        self.label(frame, "10 free solves · No card required · Your API key stays private", 9, "#C4B5FD").pack(anchor="w", pady=(22, 0))
     def _auth(self, login):
         self.clear(); card = tk.Frame(self.win, bg=PANEL); card.pack(fill="both", expand=True, padx=64, pady=54)
         inner = tk.Frame(card, bg=PANEL); inner.pack(fill="both", expand=True, padx=42, pady=42)
         self.label(inner, "Welcome back" if login else "Create an account", 21, TEXT, True).pack(anchor="w")
         self.label(inner, "Sign in to keep your ScreenSolve setup together." if login else "Start with an email and a secure password.", 10, MUTED).pack(anchor="w", pady=(8, 28))
+        status = self.label(inner, "", 9, "#FCA5A5")
+        google = self.button(inner, "Continue with Google", lambda: self._auth_task([google], status, sign_in_with_google, lambda _result: self._settings()), True)
+        google.pack(fill="x", pady=(0, 18))
         self.label(inner, "EMAIL", 9, MUTED, True).pack(anchor="w"); email = tk.Entry(inner, font=("Segoe UI", 12), bg="#0B1020", fg=TEXT, insertbackground=TEXT, relief="flat")
         email.pack(fill="x", ipady=11, pady=(6, 20)); self.label(inner, "PASSWORD", 9, MUTED, True).pack(anchor="w")
         password = tk.Entry(inner, show="•", font=("Segoe UI", 12), bg="#0B1020", fg=TEXT, insertbackground=TEXT, relief="flat")
         password.pack(fill="x", ipady=11, pady=(6, 24))
-        status = self.label(inner, "", 9, "#FCA5A5"); status.pack(anchor="w", pady=(0, 8))
+        status.pack(anchor="w", pady=(0, 8))
         def submit():
             try:
                 if not email.get().strip() or len(password.get()) < 8: raise RuntimeError("Enter an email and a password of at least 8 characters.")
-                immediate = sign_in(email.get().strip(), password.get()) if login else sign_up(email.get().strip(), password.get())
-                if not login and not immediate:
-                    messagebox.showinfo(APP_NAME, "Check your email to confirm your account, then sign in.")
-                    return self._auth(True)
-                self._settings()
+                def complete(immediate):
+                    if not login and not immediate:
+                        messagebox.showinfo(APP_NAME, "Check your email to confirm your account, then sign in.")
+                        return self._auth(True)
+                    self._settings()
+                self._auth_task([submit_button, google], status, lambda: sign_in(email.get().strip(), password.get()) if login else sign_up(email.get().strip(), password.get()), complete)
             except Exception as exc: status.config(text=str(exc))
-        self.button(inner, "Sign in" if login else "Create account", submit).pack(fill="x")
+        submit_button = self.button(inner, "Sign in" if login else "Create account", submit)
+        submit_button.pack(fill="x")
         tk.Button(inner, text="← Back", command=self._landing, fg=MUTED, bg=PANEL, bd=0, font=("Segoe UI", 10), cursor="hand2").pack(anchor="w", pady=18)
     def _settings(self):
         self.clear(); frame = tk.Frame(self.win, bg=BG); frame.pack(fill="both", expand=True, padx=64, pady=48)
@@ -366,9 +433,14 @@ class SetupWindow:
         self.label(frame, "Your plan and payment are managed securely. Your device never receives the Gemini API key.", 11, MUTED).pack(anchor="w", pady=(10, 22))
         profile = current_profile()
         if profile:
-            used, total = profile.get("requests_used", 0), profile.get("monthly_requests", 0)
-            plan = (profile.get("plan_id") or profile.get("plan_status") or "inactive").replace("_", " ").title()
-            self.label(frame, f"{plan}  ·  {used:,} of {total:,} requests used this month", 10, "#C4B5FD", True).pack(anchor="w", pady=(0, 24))
+            if profile.get("plan_status") == "active":
+                used, total = profile.get("requests_used", 0), profile.get("monthly_requests", 0)
+                plan = (profile.get("plan_id") or "plan").replace("_", " ").title()
+                usage = f"{plan}  ·  {used:,} of {total:,} requests used this month"
+            else:
+                used, total = profile.get("free_requests_used", 0), profile.get("free_requests_limit", 10)
+                usage = f"Free account  ·  {max(total - used, 0)} of {total} free requests remaining"
+            self.label(frame, usage, 10, "#C4B5FD", True).pack(anchor="w", pady=(0, 24))
         self.label(frame, "HOW IT WORKS", 9, MUTED, True).pack(anchor="w")
         self.label(frame, "1. Press Ctrl + Shift + Space\n2. Your screen is sent to the protected ScreenSolve service\n3. The answer appears in this window", 11, TEXT).pack(anchor="w", pady=(8, 22))
         if profile.get("role") == "admin":
